@@ -23,10 +23,12 @@ class Mcmc(InferenceMethod):
         if len(data_model.structures) > 1:
             raise NotImplementedError("MCMC inference does not currently support multiple structures")
 
-        self.burnin = burnin
-        self.samples = samples
-        self.infer_covar = False
-        self.display_step = kwargs.get("display_step", 1)
+        self._num_burnin = burnin
+        self._num_samples = samples
+        self._infer_covar = False
+        self._display_step = kwargs.get("display_step", 10)
+        self._target_accept = kwargs.get("target_accept", 0.5)
+        self._review_steps = kwargs.get("review_steps", 30)
 
     def run(self):
         """
@@ -36,49 +38,47 @@ class Mcmc(InferenceMethod):
         is defined by the post-burnin samples
         """
         self.log.info("Starting MCMC inference")
-        self.log.info(" -  %i voxels of %i time points" , self.data_model.data_space.size, self.data_model.ntpts)
-        self.log.info(" - Number of burn-in iterations: %i", self.burnin)
-        self.log.info(" - Number of samples to collect: %i", self.samples)
+        self.log.info(f" - {self.data_model.data_space.size} voxels of {self.data_model.ntpts} time points")
+        self.log.info(f" - Number of burn-in iterations: {self._num_burnin}")
+        self.log.info(f" - Number of samples to collect: {self._num_samples}")
+        self.log.info(f" - Target acceptance rate: {self._target_accept}, reviewed every {self._review_steps} iterations")
 
         self._create_prior_post()
 
         struc = self.data_model.structures[0]
         model = struc.model
-        n_params = model.nparams
-        # f_params = [idx for idx, p in enumerate(model.params) if p.name.startswith("f")]
-        accepted = 0
-        MH_rejected = 0
-        bounds_rejected = 0
+        num_params = model.nparams
+        num_voxels = self.data_model.data_space.size
+        accepted, rejected = [0] * num_params, [0] * num_params
+        post_samples = np.zeros([struc.size, self._num_burnin + self._num_samples, num_params], dtype=NP_DTYPE)  # [W, S, P]
+        if self._debug:
+            get_log_likelihood = self._log_likelihood
+        else:
+            get_log_likelihood = tf.function(self._log_likelihood)
 
-        samples = np.zeros([struc.size, self.burnin + self.samples, n_params])  # [W, S, P]
-        #sample_history = np.copy(samples)
-        #decision_history = np.copy(samples)
-        #likelihood_history = np.zeros(struc.size, self.burnin + self.samples)
+        # Set up proposal distribution
+        proposal = self.post.mean  # [W, P]
+        proposal_cov = np.zeros([num_voxels, num_params, num_params], dtype=NP_DTYPE)  # [W, P, P]
+        for param_idx in range(num_params):
+            proposal_cov[:, param_idx, param_idx] = 1
+        self.post.set(proposal, proposal_cov)
+
+        log_likelihood = get_log_likelihood(proposal)  # [W]
 
         # MCMC iterations
-        proposal = self.post.mean  # [W, P]
-        print("p", proposal.shape)
-        log_likelihood = self._log_likelihood(proposal)  # [W]
-        for it in range(self.burnin + self.samples):
-            samples[:, it, :] = proposal
-            if it % self.display_step == 0:
-                status = "BURNIN" if it < self.burnin else "SAMPLE"
-                self.log.info(" - Iteration %04d - %s" % (it, status))
-                if it >= self.burnin:
-                    mean = self.log_avg(self.samples[:, self.burnin:it + 1, :], axis=(0, 1))
-                    self.log.info(f"   - Mean: {mean}")
-                    #self.log.info(f"   - Noise mean: %.4g variance: %.4g" % (self.log_avg(state["noise_mean"]), self.log_avg(state["noise_var"])))
-                    #self.log.info(f"   - Cost: %.4g (latent %.4g, reconst %.4g)" % (state["cost"], state["latent"], state["reconst"]))
+        for it in range(self._num_burnin + self._num_samples):
+            post_samples[:, it, :] = proposal
+            if it % self._display_step == 0:
+                self._log_iter(it, post_samples)
 
-            # new_proposal = np.random.multivariate_normal(proposal, self.post.cov)  # [W, P]
-            new_proposal = tf.reshape(self.post.sample(1), (-1, n_params))  # [W, P]
-            print("newp", new_proposal.shape)
-            # sample_history[i, :] = new_proposal
-            # sumf = 0
-            # sumf = sum([new_proposal[idx] for idx in f_params])
-            # if np.all((new_proposal) > lb) and np.all((new_proposal) < ub) and sumf <= 1:
-            if 1:
-                new_log_likelihood = self._log_likelihood(new_proposal)
+            # Jitter all the parameters together but then iterate over each
+            # so only one is varied at a time
+            new_proposals = tf.reshape(self.post.sample(1), (-1, num_params))  # [W, P]
+            for param_idx in range(num_params):
+                param_selector = np.zeros(new_proposals.shape, dtype=bool)
+                param_selector[:, param_idx] = 1
+                new_proposal = tf.where(tf.constant(param_selector), new_proposals, proposal)
+                new_log_likelihood = get_log_likelihood(new_proposal)
 
                 # We cannot assume symmetric distribution, so the proposal distribution remains in the Metropolis condition
                 q_new2old = self.prior.log_prob(proposal)
@@ -87,28 +87,51 @@ class Mcmc(InferenceMethod):
                 accept = tf.exp(p_accept) > tf.random.uniform(p_accept.shape, dtype=TF_DTYPE)
 
                 log_likelihood = tf.where(accept, new_log_likelihood, log_likelihood)
-                proposal = tf.where(accept, new_proposal, proposal)
+                proposal = tf.where(tf.reshape(accept, [-1, 1]), new_proposal, proposal)
+                param_accepted = tf.reduce_sum(tf.cast(accept, TF_DTYPE))
+                accepted[param_idx] += param_accepted
+                rejected[param_idx] += (num_voxels - param_accepted)
 
-                self.post.set(proposal, self.post.cov)
+            if it > 0 and it % self._review_steps == 0:
+                for param_idx in range(num_params):
+                    # CHECK THE ACCEPTANCE RATIO
+                    # Following Rosenthal 2010 and so on...
+                    # For RWM, sigma=l/sqrt(d), Acc_ratio(l_opt) is:
+                    # approx 0.234 for d-dimensional with d-->inf
+                    # 0.44 for 1 dimension
+                    #
+                    # For MALA, sigma=l/(d^(1/6)), Acc_ratio(l_opt) is:
+                    # approx 0.574 for d-dimension in MALA
+                    # FSL BedpostX (Behrens, 2003) --> Don't retain ergodicity
+                    accepted_ratio = accepted[param_idx] / (accepted[param_idx] + rejected[param_idx])
+                    # acc*0.25 to have ~80% acc ratio --- acc*3 to have ~25% acc_ratio
+                    adjust_factor = np.sqrt((1 + accepted[param_idx]) / (1 + rejected[param_idx]))
+                    proposal_cov[:, param_idx, param_idx] = np.minimum(1e10, proposal_cov[:, param_idx, param_idx] * adjust_factor)
+                    self.log.debug(f" - Updating proposal variance {param_idx}: Current acceptance rate {accepted_ratio} target {self._target_accept} adjustment factor {adjust_factor}")
+                accepted, rejected = [0] * num_params, [0] * num_params
 
-        #acc_ratio = np.nan_to_num(100 * ((acc) / (bound_rej + MH_rej)), posinf=100)
-        #bound_rej_ratio = np.nan_to_num(100 * ((bound_rej) / (acc + bound_rej + MH_rej)), posinf=100)
-        #MH_rej = np.nan_to_num(100 * ((MH_rej) / (acc + bound_rej + MH_rej)), posinf=100)
+            self.post.set(proposal, proposal_cov)
 
-        samples = samples[:, self.burnin:, :]  # [W, S, P]
-        #idx = sort_f(samples[:, self.burnin:, :])
-        #hist_samples = hist_samples[:, idx]
-        #hist_decision = hist_decision[:, idx]
-
+        post_samples = post_samples[:, self._num_burnin:, :]  # [W, S, P]
         self.log.info(" - End of inference. ")
-
         state = {
-            "modelfit" : self._get_model_prediction(),
-            f"{struc.name}_mean" : np.transpose(np.mean(samples, axis=1)),  # [P, W]
-            f"{struc.name}_var" : np.transpose(np.variance(samples, axis=1)),  # [P, W]
-            #f"{struc.name}_cov"] = tf.transpose(self.struc_posts[struc.name].cov, (1, 2, 0))  # [P, P, W]
+            "modelfit" : self._get_model_prediction(np.mean(post_samples, axis=1)),
+            f"{struc.name}_mean" : np.transpose(np.mean(post_samples, axis=1)),  # [P, W]
+            f"{struc.name}_var" : np.transpose(np.var(post_samples, axis=1)),  # [P, W]
         }
+        cov = np.zeros([num_voxels, num_params, num_params])
+        for param_idx in range(num_params):
+            cov[:, param_idx, param_idx] = np.var(post_samples, axis=1)[:, param_idx]
+        state[f"{struc.name}_cov"] = cov
+
         return state
+
+    def _log_iter(self, it, post_samples):
+        status = "BURNIN" if it < self._num_burnin else "SAMPLE"
+        self.log.info(" - Iteration %04d - %s" % (it, status))
+        if it >= self._num_burnin:
+            mean = self.log_avg(post_samples[:, self._num_burnin:it + 1, :], axis=(0, 1))
+            self.log.info(f"   - Mean: {mean}")
 
     def _create_prior_post(self):
         """
@@ -131,8 +154,8 @@ class Mcmc(InferenceMethod):
                 self.log.info("     - Posterior: %s", param.post)
 
             # Create combined posterior
-            all_normal = all([p.is_normal() for p in model_posts])
-            if self.infer_covar and all_normal:
+            all_normal = all([isinstance(p, dist.Normal) for p in model_posts])
+            if self._infer_covar and all_normal:
                 if all_normal:
                     self.log.info(" - Inferring covariances (correlation) between %i model parameters" % len(model_posts))
                     post = dist.MVN(model_posts)
@@ -176,9 +199,7 @@ class Mcmc(InferenceMethod):
             model_tpts = struc.model.tpts()  # [W/1, N]
             param_samples = proposal  # [W, P]
             param_samples = tf.transpose(param_samples)[..., tf.newaxis]  # [P, W, 1]
-            print(param_samples.shape)
             pred = struc.model.evaluate(param_samples, model_tpts)  # [W, N]
-            print(pred.shape)
             pred = struc.to_source_space(pred)
             if model_prediction is None:
                 model_prediction = pred
@@ -193,7 +214,7 @@ class Mcmc(InferenceMethod):
         """
         model_prediction = self._get_model_prediction(proposal)  # [W, N]
         ll = self.noise_param.log_likelihood(self.data_model.data_space.srcdata.flat, model_prediction[:, tf.newaxis, :], self.noise_param.post.mean, self.data_model.ntpts)  # [W]
-        print(proposal.shape)
-        ll += self.prior.log_prob(proposal)  # [W]
+        prior_ll = self.prior.log_prob(proposal)  # [W]
+        ll += tf.reshape(prior_ll, [-1])
 
         return ll  # [W]
